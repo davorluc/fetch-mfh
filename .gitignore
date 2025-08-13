@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local creds & env
+service_account.json
+.env

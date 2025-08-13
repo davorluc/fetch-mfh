@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 ZH + ZG Baugesuche (BP-ZH, BP-ZG) → MFH-only (Mehrfamilienhaus-like) with Bauherrschaft.
+Fetches ONLY publications from *today* (Europe/Zurich) using publicationDate.start/end.
 
 Flow:
-- List via /publications/xml with cantons=ZH,ZG and rubrics=BP-ZH,BP-ZG
+- List via /publications/xml with cantons=ZH,ZG and rubrics=BP-ZH,BP-ZG + today's date filter
 - Follow each 'ref' to detail XML
 - Extract Bauherrschaft (ZH: precise; ZG: best-known paths + heuristic)
 - Filter to MFH-like projects (MFH / Mehrfamilienhaus / Wohnblock / Reihenhaus / Wohnüberbauung / etc.)
@@ -21,6 +22,13 @@ import xml.etree.ElementTree as ET
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from datetime import datetime
+try:
+    # Python 3.9+: stdlib time zone
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # fallback to naive local date if unavailable
+
 BASE_LIST = "https://www.amtsblattportal.ch/api/v1/publications/xml"
 CANTONS = ["ZH", "ZG"]
 RUBRICS = ["BP-ZH", "BP-ZG"]
@@ -29,7 +37,7 @@ OUTFILE = "baugesuche_ZH_ZG_MFH.csv"
 REQUEST_TIMEOUT = 30
 MAX_WORKERS = 16
 
-HEADERS = {"User-Agent": "baugesuche-zh-zg-mfh/1.0"}
+HEADERS = {"User-Agent": "baugesuche-zh-zg-mfh/1.1"}
 
 # --- MFH keyword set (expand as needed) ---
 MFH_PATTERNS = [
@@ -43,6 +51,14 @@ MFH_PATTERNS = [
     r"\bMehrfamiliengebäude\b", r"\bMehrfamilienwohngebäude\b",
 ]
 MFH_REGEX = re.compile("|".join(MFH_PATTERNS), flags=re.IGNORECASE | re.UNICODE)
+
+
+def today_ch() -> str:
+    """Return today's date in Europe/Zurich as YYYY-MM-DD."""
+    if ZoneInfo is not None:
+        return datetime.now(ZoneInfo("Europe/Zurich")).date().isoformat()
+    # Fallback (less precise if system TZ not Zurich)
+    return datetime.now().date().isoformat()
 
 
 def make_session() -> requests.Session:
@@ -61,12 +77,14 @@ def make_session() -> requests.Session:
     return s
 
 
-def fetch_list_page(session: requests.Session, page: int) -> Optional[str]:
+def fetch_list_page(session: requests.Session, page: int, date_str: str) -> Optional[str]:
     params = [
         ("publicationStates", "PUBLISHED"),
         *[( "cantons", c ) for c in CANTONS],
         *[( "rubrics", r ) for r in RUBRICS],
-        ("pageRequest.page", page),      # 0-based
+        ("publicationDate.start", date_str),  # <-- today
+        ("publicationDate.end",   date_str),  # <-- today
+        ("pageRequest.page", page),           # 0-based
         ("pageRequest.size", PAGE_SIZE),
     ]
     r = session.get(BASE_LIST, params=params, timeout=REQUEST_TIMEOUT)
@@ -155,23 +173,15 @@ def text_of(elem: Optional[ET.Element]) -> str:
 # ---------- Bauherrschaft extractors ----------
 
 def extract_bauherrschaft_precise_zh(root: ET.Element) -> str:
-    """
-    ZH (BP-ZH01) places Bauherrschaft under <content><buildingContractor>.
-    Extract persons/companies cleanly if present.
-    """
     bc = root.find(".//{*}content/{*}buildingContractor")
     if bc is None:
         return ""
-
     pieces: List[str] = []
-
-    # Persons
     for person in bc.findall(".//{*}persons/{*}person"):
         prename = (person.findtext(".//{*}prename") or "").strip()
         name = (person.findtext(".//{*}name") or "").strip()
         full = " ".join(x for x in [prename, name] if x)
         if full:
-            # Optional: add address if available
             addr = person.find(".//{*}addressSwitzerland")
             if addr is not None:
                 addr_txt = " ".join(filter(None, [
@@ -183,20 +193,14 @@ def extract_bauherrschaft_precise_zh(root: ET.Element) -> str:
                 if addr_txt:
                     full = f"{full} ({addr_txt})"
             pieces.append(full)
-
-    # Companies
     for company in bc.findall(".//{*}companies/{*}company"):
         cname = (company.findtext(".//{*}name") or "").strip()
         if cname:
             custom_addr = (company.findtext(".//{*}customAddress") or "").strip().replace("\n", ", ")
             pieces.append(f"{cname} ({custom_addr})" if custom_addr else cname)
-
-    # Fallback: whole block
     if not pieces:
         txt = " ".join(text_of(el) for el in bc)
         return " ".join(txt.split())
-
-    # Dedupe keep order
     seen, uniq = set(), []
     for p in pieces:
         if p and p not in seen:
@@ -206,18 +210,10 @@ def extract_bauherrschaft_precise_zh(root: ET.Element) -> str:
 
 
 def extract_bauherrschaft_precise_zg(root: ET.Element) -> str:
-    """
-    Best-effort for ZG (BP-ZG):
-    Try under <content> for known containers, else party structures.
-    If schema differs, the heuristic will still catch most cases.
-    """
     content = root.find(".//{*}content")
     if content is None:
         return ""
-
     pieces: List[str] = []
-
-    # Common container names we see across schemas
     for path in [
         ".//{*}buildingContractor",
         ".//{*}bauherrschaft",
@@ -226,7 +222,6 @@ def extract_bauherrschaft_precise_zg(root: ET.Element) -> str:
         ".//{*}applicants/{*}applicant",
     ]:
         for node in content.findall(path):
-            # Prefer structured person/company data if present
             for person in node.findall(".//{*}persons/{*}person"):
                 prename = (person.findtext(".//{*}prename") or "").strip()
                 name = (person.findtext(".//{*}name") or "").strip()
@@ -238,25 +233,18 @@ def extract_bauherrschaft_precise_zg(root: ET.Element) -> str:
                 if cname:
                     custom_addr = (company.findtext(".//{*}customAddress") or "").strip().replace("\n", ", ")
                     pieces.append(f"{cname} ({custom_addr})" if custom_addr else cname)
-
-            # If nothing structured, take the node’s text
             if not pieces:
                 txt = text_of(node).strip()
                 if txt:
                     pieces.append(" ".join(txt.split()))
-
-    # If still empty, try generic party structures anywhere in content
     if not pieces:
         for path in [".//{*}party", ".//{*}person", ".//{*}company"]:
             for node in content.findall(path):
                 txt = text_of(node).strip()
                 if txt:
                     pieces.append(" ".join(txt.split()))
-
     if not pieces:
         return ""
-
-    # Dedupe keep order
     seen, uniq = set(), []
     for p in pieces:
         if p and p not in seen:
@@ -270,8 +258,6 @@ def extract_bauherrschaft(detail_xml: str, canton: str) -> str:
         root = ET.fromstring(detail_xml)
     except ET.ParseError:
         return ""
-
-    # Canton-specific first
     if canton == "ZH":
         val = extract_bauherrschaft_precise_zh(root)
         if val:
@@ -280,8 +266,6 @@ def extract_bauherrschaft(detail_xml: str, canton: str) -> str:
         val = extract_bauherrschaft_precise_zg(root)
         if val:
             return val
-
-    # Heuristic fallback for unknown layouts
     acc = []
     for node in root.iter():
         tag = node.tag.split("}", 1)[-1].lower()
@@ -293,8 +277,7 @@ def extract_bauherrschaft(detail_xml: str, canton: str) -> str:
         seen, out = set(), []
         for t in acc:
             if t and t not in seen:
-                seen.add(t)
-                out.append(t)
+                seen.add(t); out.append(t)
         return " | ".join(out)
     return ""
 
@@ -302,15 +285,10 @@ def extract_bauherrschaft(detail_xml: str, canton: str) -> str:
 # ---------- MFH classifier ----------
 
 def is_mfh_like(detail_xml: str, title: str) -> Optional[str]:
-    """
-    Return the matching term if the publication looks like MFH/Wohnblock/Reihenhaus/etc., else None.
-    We scan title + projectDescription + full <content> text.
-    """
     try:
         root = ET.fromstring(detail_xml)
     except ET.ParseError:
         root = None
-
     haystack_parts = [title or ""]
     if root is not None:
         pd = root.find(".//{*}content/{*}projectDescription")
@@ -319,7 +297,6 @@ def is_mfh_like(detail_xml: str, title: str) -> Optional[str]:
         content = root.find(".//{*}content")
         if content is not None:
             haystack_parts.append(text_of(content))
-
     haystack = " ".join(haystack_parts)
     m = MFH_REGEX.search(haystack)
     return m.group(0) if m else None
@@ -327,12 +304,14 @@ def is_mfh_like(detail_xml: str, title: str) -> Optional[str]:
 
 def main():
     session = make_session()
+    today = today_ch()
+    print(f"[LIST] Filtering for publicationDate.start=end={today}")
 
-    # 1) Paginated list (ZH + ZG)
+    # 1) Paginated list (ZH + ZG) for TODAY only
     page = 0
     items: List[Dict[str, str]] = []
     while True:
-        xml_text = fetch_list_page(session, page)
+        xml_text = fetch_list_page(session, page, today)
         if not xml_text:
             break
         batch = parse_list(xml_text)
@@ -344,7 +323,7 @@ def main():
             break
         page += 1
 
-    print(f"[LIST] total: {len(items)} publications (ZH+ZG)")
+    print(f"[LIST] total: {len(items)} publications (ZH+ZG, {today})")
 
     # 2) Fetch details concurrently, extract Bauherrschaft, filter MFH-like
     results = []
@@ -356,11 +335,9 @@ def main():
             detail = fut.result()
             if not detail:
                 continue
-
             match_term = is_mfh_like(detail, meta.get("title", ""))
             if not match_term:
-                continue  # skip non-MFH projects
-
+                continue
             canton = (meta.get("canton") or "").strip() or "ZH"
             bauherr = extract_bauherrschaft(detail, canton)
             results.append({
@@ -380,11 +357,10 @@ def main():
             fieldnames=["canton", "publicationNumber", "date", "title", "bauherrschaft", "match_term", "ref"]
         )
         writer.writeheader()
-        # sort by canton then date desc
         results.sort(key=lambda r: (r["canton"], r["date"], r["publicationNumber"]), reverse=True)
         writer.writerows(results)
 
-    print(f"[OK] MFH-only: {len(results)} rows → {OUTFILE} in {time.time()-started:.2f}s")
+    print(f"[OK] MFH-only (today={today}): {len(results)} rows → {OUTFILE} in {time.time()-started:.2f}s")
 
 
 if __name__ == "__main__":
