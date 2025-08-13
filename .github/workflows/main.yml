@@ -1,0 +1,52 @@
+name: Baugesuche MFH → Google Sheets
+
+on:
+  schedule:
+    - cron: "0 16 * * *"   # 03:00 UTC daily (~05:00 Europe/Zurich)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Google credentials
+        run: |
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > service_account.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/service_account.json" >> $GITHUB_ENV
+
+      # Full run once: set MODE=FULL in this step, then switch to DAILY
+      - name: Run scraper (DAILY)
+        env:
+          MODE: DAILY                 # change to FULL for the first historical load
+        run: |
+          python fetch_baugesuche_mehrfamilienhaus_ZH_ZG.py
+
+      - name: Upload to Google Sheets (append)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+        run: |
+          python sheets_uploader.py \
+            --csv baugesuche_ZH_ZG_MFH.csv \
+            --sheet "MFH_ZH_ZG" \
+            --mode append
+
+      - name: Keep CSV as artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: baugesuche-csv
+          path: baugesuche_ZH_ZG_MFH.csv
