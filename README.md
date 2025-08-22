@@ -86,4 +86,3 @@ This repository is a showcase of using:
 * Google Cloud APIs (Drive/Sheets)
 * GitHub Actions automation
 * Reproducible development environments (Nix)
-```
